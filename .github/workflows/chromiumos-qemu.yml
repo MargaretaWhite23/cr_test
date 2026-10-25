@@ -55,7 +55,10 @@ jobs:
           chmod 600 "$HOME/.ssh/hetzner_key"
           printf '%s\n' "$HETZNER_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          ssh -N -f -i "$HOME/.ssh/hetzner_key" \
+          echo "Starting non-interactive reverse SSH tunnel"
+          timeout 30s ssh -N -f -T -v -i "$HOME/.ssh/hetzner_key" \
+            -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 -o ConnectionAttempts=1 \
             -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes \
             -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
             -R 127.0.0.1:15900:127.0.0.1:5900 \
