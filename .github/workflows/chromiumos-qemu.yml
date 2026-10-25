@@ -1,0 +1,134 @@
+name: ChromiumOS QEMU remote desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "Keep test session alive (max 300)"
+        required: false
+        default: "45"
+
+permissions:
+  contents: read
+
+jobs:
+  chromiumos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      DISPLAY: ":99"
+      HETZNER_HOST: ${{ secrets.HETZNER_HOST }}
+      HETZNER_USER: ${{ secrets.HETZNER_USER }}
+      HETZNER_SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+      HETZNER_KNOWN_HOSTS: ${{ secrets.HETZNER_KNOWN_HOSTS }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install QEMU and desktop
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            qemu-system-x86 qemu-utils ovmf xz-utils curl jq python3 \
+            xvfb xfce4 xfce4-terminal tigervnc-standalone-server \
+            x11vnc openssh-client netcat-openbsd
+          free -h
+          df -h .
+          test -c /dev/kvm && echo "KVM available" || echo "::warning::KVM unavailable; emulation will be slow"
+
+      - name: Start Xvfb desktop and loopback VNC
+        run: |
+          mkdir -p "$HOME/.vnc" "$RUNNER_TEMP/session"
+          Xvfb :99 -screen 0 1600x900x24 -nolisten tcp > "$RUNNER_TEMP/session/xvfb.log" 2>&1 &
+          sleep 2
+          DISPLAY=:99 dbus-run-session -- startxfce4 > "$RUNNER_TEMP/session/xfce.log" 2>&1 &
+          x11vnc -display :99 -localhost -rfbport 5900 -nopw -forever -shared \
+            > "$RUNNER_TEMP/session/vnc.log" 2>&1 &
+          sleep 3
+          nc -z 127.0.0.1 5900
+
+      - name: Configure reverse SSH to Hetzner
+        if: ${{ env.HETZNER_HOST != '' && env.HETZNER_USER != '' && env.HETZNER_SSH_KEY != '' && env.HETZNER_KNOWN_HOSTS != '' }}
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$HETZNER_SSH_KEY" > "$HOME/.ssh/hetzner_key"
+          chmod 600 "$HOME/.ssh/hetzner_key"
+          printf '%s\n' "$HETZNER_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ssh -N -f -i "$HOME/.ssh/hetzner_key" \
+            -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=20 -o ServerAliveCountMax=3 \
+            -R 127.0.0.1:15900:127.0.0.1:5900 \
+            "$HETZNER_USER@$HETZNER_HOST"
+          echo "Reverse tunnel established: Hetzner 127.0.0.1:15900 -> runner VNC"
+
+      - name: Check tunnel setup
+        if: ${{ env.HETZNER_HOST == '' || env.HETZNER_USER == '' || env.HETZNER_SSH_KEY == '' || env.HETZNER_KNOWN_HOSTS == '' }}
+        run: echo "::warning::Hetzner secrets missing; VNC remains runner-local."
+
+      - name: Download newest official ChromiumOS generic VM image
+        run: |
+          mkdir -p "$RUNNER_TEMP/chromiumos"
+          python3 scripts/download_chromiumos.py "$RUNNER_TEMP/chromiumos"
+          ls -lh "$RUNNER_TEMP/chromiumos"
+          df -h .
+
+      - name: Launch 8 GB ChromiumOS VM in QEMU
+        run: |
+          IMAGE="$RUNNER_TEMP/chromiumos/chromiumos_test_image.bin"
+          test -s "$IMAGE"
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ACCEL="kvm"
+            CPU="host"
+          else
+            ACCEL="tcg"
+            CPU="max"
+            echo "::warning::KVM unavailable; ChromiumOS may not boot within the test window."
+          fi
+          qemu-system-x86_64 \
+            -machine "q35,accel=$ACCEL" \
+            -m 8192 -smp 2 -cpu "$CPU" \
+            -device virtio-rng-pci \
+            -device virtio-scsi-pci,id=scsi \
+            -drive if=none,id=hd,file="$IMAGE",format=raw,cache=unsafe \
+            -device scsi-hd,drive=hd,bootindex=0 \
+            -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
+            -device virtio-net-pci,netdev=net0 \
+            -vga virtio -display gtk,show-cursor=on \
+            -device usb-ehci,id=ehci -device usb-tablet \
+            -device virtio-keyboard-pci \
+            -serial file:"$RUNNER_TEMP/session/serial.log" \
+            -monitor unix:"$RUNNER_TEMP/session/qemu-monitor.sock",server,nowait \
+            -pidfile "$RUNNER_TEMP/session/qemu.pid" \
+            -daemonize
+          sleep 20
+          kill -0 "$(cat "$RUNNER_TEMP/session/qemu.pid")"
+          echo "QEMU process running; this does not prove guest OS successfully booted."
+
+      - name: Probe guest and capture desktop
+        run: |
+          for i in $(seq 1 12); do
+            if nc -z 127.0.0.1 2222; then
+              echo "Guest SSH port open"
+              break
+            fi
+            sleep 5
+          done
+          DISPLAY=:99 import -window root "$RUNNER_TEMP/session/screen.png" || true
+          echo "Guest SSH accessible: $(nc -z 127.0.0.1 2222 && echo yes || echo no)"
+
+      - name: Keep remote session available
+        run: |
+          MINUTES="${{ inputs.session_minutes || '45' }}"
+          [[ "$MINUTES" =~ ^[0-9]+$ ]] || exit 1
+          (( MINUTES >= 1 && MINUTES <= 300 )) || exit 1
+          echo "VNC via workstation: ssh -N -L 5900:127.0.0.1:15900 USER@HETZNER"
+          sleep "$((MINUTES * 60))"
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromiumos-diagnostics
+          path: ${{ runner.temp }}/session/
+          if-no-files-found: ignore
