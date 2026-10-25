@@ -1,0 +1,26 @@
+name: Hetzner Network Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  network-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Identify runner public IP
+        run: |
+          echo "=== RUNNER PUBLIC IPv4 ==="
+          curl -4 -fsS --connect-timeout 10 --max-time 20 https://api.ipify.org
+          echo
+
+      - name: Test Hetzner SSH connectivity
+        env:
+          HETZNER_HOST: ${{ secrets.HETZNER_HOST }}
+        run: |
+          echo "=== TCP PORT 22 ==="
+          timeout 12 bash -c \
+            'echo > /dev/tcp/"$HETZNER_HOST"/22' \
+            && echo TCP_22_REACHABLE \
+            || echo TCP_22_TIMEOUT_OR_BLOCKED
+
+          echo "=== TEST COMPLETE ==="
