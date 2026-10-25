@@ -31,7 +31,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             qemu-system-x86 qemu-utils ovmf xz-utils curl jq python3 \
             xvfb xfce4 xfce4-terminal tigervnc-standalone-server \
-            x11vnc openssh-client netcat-openbsd
+            x11vnc imagemagick openssh-client netcat-openbsd
           free -h
           df -h .
           test -c /dev/kvm && echo "KVM available" || echo "::warning::KVM unavailable; emulation will be slow"
